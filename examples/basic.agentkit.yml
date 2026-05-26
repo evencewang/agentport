@@ -1,0 +1,70 @@
+version: 1
+project:
+  name: Shared Team Setup
+
+instructions:
+  shared:
+    - Prefer small, reviewable patches.
+    - Run the narrowest useful verification before finishing.
+    - Do not change unrelated files.
+  byTarget:
+    claude:
+      - Use project slash commands when they match the task.
+    cursor:
+      - Keep responses concise in chat.
+
+rules:
+  - name: frontend
+    description: Frontend conventions for React files.
+    targets: [cursor]
+    cursor:
+      mode: auto
+      globs:
+        - "src/**/*.tsx"
+        - "src/**/*.ts"
+    content: |
+      Prefer function components.
+
+      Keep state local unless multiple siblings need coordination.
+
+commands:
+  - name: review-changes
+    description: Summarize local changes and call out risks.
+    targets: [claude, cursor, opencode]
+    prompt: |
+      Review the current local changes.
+
+      Summarize what changed in a few bullets, then list the main risks.
+
+skills:
+  - name: write-release-notes
+    description: Draft release notes from recent changes.
+    targets: [claude, codex, opencode]
+    content: |
+      Draft release notes from the recent git history.
+
+      Keep the output short, grouped by user-visible impact.
+
+mcpServers:
+  - name: context7
+    targets: [claude, cursor, opencode]
+    transport: http
+    url: https://mcp.context7.com/mcp
+    headers:
+      CONTEXT7_API_KEY: "{env:CONTEXT7_API_KEY}"
+
+profiles:
+  - name: universal-core
+    description: Portable baseline for common coding agents.
+    targets: [claude, cursor, opencode]
+    mcpServers: [context7]
+    commands: [review-changes]
+    skills: [write-release-notes]
+    rules: [frontend]
+
+  - name: docs-only
+    description: Instructions and release-note skill without tool commands or MCP.
+    targets: [claude, codex]
+    commands: []
+    mcpServers: []
+    skills: [write-release-notes]
