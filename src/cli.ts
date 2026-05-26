@@ -6,12 +6,19 @@ import { fileURLToPath } from "node:url";
 
 import { buildProject, formatStdoutOutputs } from "./build.js";
 import {
+  INTERACTIVE_ENV_POLICY,
+  NON_INTERACTIVE_ENV_POLICY,
+  type EnvPolicy
+} from "./import-env.js";
+import { runInteractiveImport } from "./import-interactive.js";
+import { createClackPromptAdapter } from "./import-prompts.js";
+import {
   assertValidImportCategories,
   assertValidImportSources,
   importProject,
   type ImportResult
 } from "./import.js";
-import { TARGETS, type BuildOptions, type Target } from "./types.js";
+import { IMPORT_CATEGORIES, IMPORT_SOURCES, TARGETS, type BuildOptions, type Target } from "./types.js";
 
 const DEFAULT_CONFIG_PATH = "agentkit.yml";
 const DEFAULT_OUT_DIR = ".generated";
@@ -31,6 +38,9 @@ Usage:
                   [--dry-run | --stdout]
   agentport import --from claude,cursor --include mcp,skills,commands
                    [--config path] [--source-dir dir] [--dry-run]
+                   [--env-policy preserve|placeholder]
+  agentport import --interactive [--from sources] [--include categories]
+                                  [--config path] [--source-dir dir] [--dry-run]
 
 Options:
   --profile <name>     Build using a named profile from agentkit.yml.
@@ -41,6 +51,12 @@ Options:
   --from <sources>     Import from claude, cursor, opencode, and/or codex.
   --include <items>    Import mcp, skills, commands, or all.
   --source-dir <dir>   Source directory to scan for import inputs.
+  --interactive        Run import with prompts for selection and conflict
+                       resolution before writing agentkit.yml.
+  --env-policy <name>  preserve (default) keeps non-placeholder MCP env/header
+                       values literally; placeholder rewrites literal/masked
+                       MCP secrets to {env:NAME} placeholders without writing
+                       secret values.
 
 Examples:
   agentport init
@@ -49,6 +65,7 @@ Examples:
   agentport build --profile core --target claude --dry-run
   agentport build --profile core --all-targets --stdout
   agentport import --from claude --include all --dry-run
+  agentport import --interactive
 `);
 }
 
@@ -295,6 +312,10 @@ function printImportResult(result: ImportResult): void {
     console.warn(`[possible-duplicate:${duplicate.category}] ${duplicate.message}`);
   }
 
+  for (const action of result.envActionItems) {
+    console.log(`[env-action:${action.itemName}] ${action.message}`);
+  }
+
   for (const conflict of result.conflicts) {
     console.error(`[conflict:${conflict.category}] ${conflict.message}`);
   }
@@ -310,28 +331,76 @@ function printImportResult(result: ImportResult): void {
   }
 }
 
+function parseEnvPolicy(value: string | undefined): EnvPolicy | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "preserve") {
+    return NON_INTERACTIVE_ENV_POLICY;
+  }
+  if (value === "placeholder") {
+    return INTERACTIVE_ENV_POLICY;
+  }
+  throw new Error(
+    `Unsupported --env-policy "${value}". Supported values: preserve, placeholder. ${HELP_HINT}`
+  );
+}
+
 async function runImport(args: string[]): Promise<void> {
   validateArgs(args, {
     "--from": "value",
     "--include": "value",
     "--config": "value",
     "--source-dir": "value",
-    "--dry-run": "boolean"
+    "--dry-run": "boolean",
+    "--interactive": "boolean",
+    "--env-policy": "value"
   });
 
-  const sources = assertValidImportSources(parseCommaSeparatedValues(getFlagValues(args, "--from")));
-  const categories = assertValidImportCategories(
-    parseCommaSeparatedValues(getFlagValues(args, "--include"))
-  );
+  const interactive = hasFlag(args, "--interactive");
+  const fromInputs = parseCommaSeparatedValues(getFlagValues(args, "--from"));
+  const includeInputs = parseCommaSeparatedValues(getFlagValues(args, "--include"));
   const configPath = getFlagValue(args, "--config") ?? DEFAULT_CONFIG_PATH;
   const sourceDir = getFlagValue(args, "--source-dir") ?? process.cwd();
+  const envPolicy = parseEnvPolicy(getFlagValue(args, "--env-policy"));
+  const dryRun = hasFlag(args, "--dry-run");
+
+  if (interactive) {
+    const sources = fromInputs.length > 0 ? assertValidImportSources(fromInputs) : undefined;
+    if (fromInputs.length > 0) {
+      // Validation already throws on bad values via assertValidImportSources above.
+    }
+    const categories =
+      includeInputs.length > 0 ? assertValidImportCategories(includeInputs) : undefined;
+
+    const adapter = await createClackPromptAdapter();
+    const outcome = await runInteractiveImport({
+      configPath,
+      sourceDir,
+      ...(sources ? { sources } : {}),
+      ...(categories ? { categories } : {}),
+      dryRun,
+      ...(envPolicy ? { envPolicy } : {}),
+      adapter
+    });
+
+    if (outcome.cancelled) {
+      process.exitCode = 1;
+      return;
+    }
+    return;
+  }
+
+  const sources = assertValidImportSources(fromInputs);
+  const categories = assertValidImportCategories(includeInputs);
 
   const result = await importProject({
     configPath,
     sourceDir,
     sources,
     categories,
-    dryRun: hasFlag(args, "--dry-run")
+    dryRun,
+    ...(envPolicy ? { envPolicy } : {})
   });
 
   printImportResult(result);

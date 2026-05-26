@@ -137,8 +137,18 @@ test("discovers supported Claude, Cursor, OpenCode, and Codex import paths", asy
   assert.equal(codexHttp?.transport, "http");
   assert.equal(codexHttp?.url, "https://codex.example/mcp");
   assert.equal(codexHttp?.headers?.Authorization, "Bearer codex");
-  assert.equal(codexHttp?.headers?.X_API_KEY, "CODEX_API_KEY");
+  assert.equal(codexHttp?.headers?.X_API_KEY, "{env:CODEX_API_KEY}");
   assert.ok(result.warnings.length >= 4);
+  assert.ok(
+    result.envActionItems.some(
+      (item) => item.itemName === "codexHttp" && item.reason === "env-http-headers"
+    )
+  );
+  assert.ok(
+    result.envActionItems.some(
+      (item) => item.itemName === "codexHttp" && item.reason === "authorization-conflict"
+    )
+  );
 });
 
 test("category selection imports only requested categories", async () => {

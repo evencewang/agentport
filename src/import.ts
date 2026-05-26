@@ -4,6 +4,15 @@ import YAML from "yaml";
 
 import { loadConfig } from "./config.js";
 import {
+  applyEnvPolicyToServer,
+  NON_INTERACTIVE_ENV_POLICY,
+  normalizeMcpEnvAndHeaders,
+  redactValue,
+  type EnvActionItem,
+  type EnvPolicy,
+  type RawEnvSourceMcp
+} from "./import-env.js";
+import {
   IMPORT_CATEGORIES,
   IMPORT_SOURCES,
   TARGETS,
@@ -23,11 +32,31 @@ const HELP_HINT = "Run agentport --help for usage.";
 type ConfigCategory = "mcpServers" | "skills" | "commands";
 type ImportedItem = McpServerConfig | SkillConfig | CommandConfig;
 
+export type ConflictSource = "base-config" | "earlier-candidate";
+
+export type CandidateClassification =
+  | { kind: "new" }
+  | { kind: "unchanged" }
+  | { kind: "merge"; mergedTargets: Target[] }
+  | {
+      kind: "conflict";
+      differenceDimensions: string[];
+      safeMergeAvailable: boolean;
+      conflictSource: ConflictSource;
+      existing: ImportedItem;
+      existingSummary: string;
+      incomingSummary: string;
+    };
+
 export interface DiscoveredItem {
+  id: string;
   category: ConcreteImportCategory;
   item: ImportedItem;
   source: ImportSource;
   sourcePath: string;
+  classification: CandidateClassification;
+  possibleDuplicates: ImportPossibleDuplicate[];
+  envActionItems: EnvActionItem[];
 }
 
 export interface ImportDiscoveryStatus {
@@ -44,6 +73,7 @@ export interface ImportOptions {
   sources: ImportSource[];
   categories: ImportCategory[];
   dryRun?: boolean;
+  envPolicy?: EnvPolicy;
 }
 
 export interface ImportSkip {
@@ -91,6 +121,47 @@ export interface ImportCounts {
   warnings: number;
 }
 
+export interface ImportPlan {
+  configPath: string;
+  sourceDir: string;
+  sources: ImportSource[];
+  categories: ConcreteImportCategory[];
+  baseConfig: AgentportConfig;
+  candidates: DiscoveredItem[];
+  discovery: ImportDiscoveryStatus[];
+  skipped: ImportSkip[];
+  warnings: ImportWarning[];
+  envActionItems: EnvActionItem[];
+  envPolicy: EnvPolicy;
+}
+
+export type ConflictAction =
+  | { type: "keep" }
+  | { type: "replace" }
+  | { type: "rename"; newName: string }
+  | { type: "merge" }
+  | { type: "skip" }
+  | { type: "abort" };
+
+export interface EnvOverride {
+  candidateId: string;
+  fieldKind: "env" | "header";
+  fieldKey: string;
+  envVar: string;
+}
+
+export interface ResolvedSelection {
+  selectedIds: Set<string>;
+  conflictActions: Map<string, ConflictAction>;
+  envOverrides?: EnvOverride[];
+}
+
+export interface ApplyImportOptions {
+  plan: ImportPlan;
+  selection?: ResolvedSelection;
+  dryRun?: boolean;
+}
+
 export interface ImportResult {
   configPath: string;
   sourceDir: string;
@@ -104,10 +175,12 @@ export interface ImportResult {
   conflicts: ImportConflict[];
   possibleDuplicates: ImportPossibleDuplicate[];
   warnings: ImportWarning[];
+  envActionItems: EnvActionItem[];
   countsByCategory: Record<ConcreteImportCategory, ImportCounts>;
   configWritten: boolean;
   configChanged: boolean;
   dryRun: boolean;
+  aborted: boolean;
   mergedConfig: AgentportConfig;
 }
 
@@ -179,20 +252,30 @@ function asTargets(value: unknown): Target[] | undefined {
   return targets.length > 0 ? targets : undefined;
 }
 
+interface NormalizedMcpResult {
+  server: McpServerConfig;
+  actionItems: EnvActionItem[];
+}
+
 function normalizeMcpServer(
   name: string,
   raw: unknown,
   source: ImportSource,
   sourcePath: string,
-  warnings: ImportWarning[]
-): McpServerConfig | undefined {
+  warnings: ImportWarning[],
+  policy: EnvPolicy
+): NormalizedMcpResult | undefined {
   if (!isRecord(raw)) {
     return undefined;
   }
 
-  const env = asStringRecord(raw.env);
-  const headers = asStringRecord(raw.headers) ?? asStringRecord(raw.http_headers);
-  const envHttpHeaders = asStringRecord(raw.env_http_headers);
+  const rawEnv = asStringRecord(raw.env);
+  const rawHeaders = asStringRecord(raw.headers) ?? asStringRecord(raw.http_headers);
+  const rawEnvHttpHeaders = asStringRecord(raw.env_http_headers);
+  const bearerCandidates = ["bearer_token_env_var", "bearerTokenEnvVar"];
+  const bearerKey = bearerCandidates.find((key) => typeof raw[key] === "string");
+  const bearerTokenEnvVar = bearerKey ? String(raw[bearerKey]) : undefined;
+
   const commandArray = asStringArray(raw.command);
   const command = commandArray ? commandArray[0] : typeof raw.command === "string" ? raw.command : undefined;
   const args = commandArray ? commandArray.slice(1) : asStringArray(raw.args);
@@ -201,7 +284,21 @@ function normalizeMcpServer(
   const type = typeof raw.type === "string" ? raw.type : undefined;
   const explicitTransport = typeof raw.transport === "string" ? raw.transport : undefined;
 
-  if (env || headers || envHttpHeaders || Object.keys(raw).some((key) => key.includes("bearer"))) {
+  const rawShape: RawEnvSourceMcp = {
+    ...(rawEnv ? { env: rawEnv } : {}),
+    ...(rawHeaders ? { headers: rawHeaders } : {}),
+    ...(rawEnvHttpHeaders ? { envHttpHeaders: rawEnvHttpHeaders } : {}),
+    ...(bearerTokenEnvVar ? { bearerTokenEnvVar } : {})
+  };
+  const normalized = normalizeMcpEnvAndHeaders(name, rawShape, policy);
+
+  const hasEnvLike =
+    rawEnv ||
+    rawHeaders ||
+    rawEnvHttpHeaders ||
+    bearerTokenEnvVar ||
+    Object.keys(raw).some((key) => key.includes("bearer"));
+  if (hasEnvLike) {
     warnings.push({
       source,
       category: "mcp",
@@ -212,25 +309,27 @@ function normalizeMcpServer(
   }
 
   if (command) {
-    return {
+    const server: McpServerConfig = {
       name,
       ...(targets ? { targets } : {}),
       transport: "stdio",
       command,
       ...(args ? { args } : {}),
-      ...(env ? { env } : {})
+      ...(normalized.env ? { env: normalized.env } : {})
     };
+    return { server, actionItems: normalized.actionItems };
   }
 
   if (url) {
     const transport = explicitTransport === "sse" || type === "sse" ? "sse" : "http";
-    return {
+    const server: McpServerConfig = {
       name,
       ...(targets ? { targets } : {}),
       transport,
       url,
-      ...(headers ?? envHttpHeaders ? { headers: { ...(headers ?? {}), ...(envHttpHeaders ?? {}) } } : {})
+      ...(normalized.headers ? { headers: normalized.headers } : {})
     };
+    return { server, actionItems: normalized.actionItems };
   }
 
   return undefined;
@@ -252,11 +351,20 @@ function getMcpMap(json: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
+interface DiscoveryRawItem {
+  category: ConcreteImportCategory;
+  item: ImportedItem;
+  source: ImportSource;
+  sourcePath: string;
+  envActionItems: EnvActionItem[];
+}
+
 async function discoverJsonMcp(
   source: ImportSource,
   sourcePath: string,
-  warnings: ImportWarning[]
-): Promise<DiscoveredItem[]> {
+  warnings: ImportWarning[],
+  policy: EnvPolicy
+): Promise<DiscoveryRawItem[]> {
   const json = await readJsonFile(sourcePath);
   if (json === undefined) {
     return [];
@@ -269,18 +377,29 @@ async function discoverJsonMcp(
 
   return Object.entries(mcpMap)
     .sort(([a], [b]) => a.localeCompare(b))
-    .flatMap(([name, raw]) => {
-      const item = normalizeMcpServer(name, raw, source, sourcePath, warnings);
-      return item ? [{ category: "mcp" as const, item, source, sourcePath }] : [];
+    .flatMap(([name, raw]): DiscoveryRawItem[] => {
+      const normalized = normalizeMcpServer(name, raw, source, sourcePath, warnings, policy);
+      if (!normalized) {
+        return [];
+      }
+      return [
+        {
+          category: "mcp",
+          item: normalized.server,
+          source,
+          sourcePath,
+          envActionItems: normalized.actionItems
+        }
+      ];
     });
 }
 
 async function discoverCommands(
   source: ImportSource,
   commandsDir: string
-): Promise<DiscoveredItem[]> {
+): Promise<DiscoveryRawItem[]> {
   const names = await safeReadDir(commandsDir);
-  const items: DiscoveredItem[] = [];
+  const items: DiscoveryRawItem[] = [];
 
   for (const fileName of names) {
     if (!fileName.endsWith(".md")) {
@@ -292,6 +411,7 @@ async function discoverCommands(
       category: "commands",
       source,
       sourcePath,
+      envActionItems: [],
       item: {
         name: path.basename(fileName, ".md"),
         prompt: await readFile(sourcePath, "utf8")
@@ -302,9 +422,12 @@ async function discoverCommands(
   return items;
 }
 
-async function discoverSkills(source: ImportSource, skillsDir: string): Promise<DiscoveredItem[]> {
+async function discoverSkills(
+  source: ImportSource,
+  skillsDir: string
+): Promise<DiscoveryRawItem[]> {
   const names = await safeReadDir(skillsDir);
-  const items: DiscoveredItem[] = [];
+  const items: DiscoveryRawItem[] = [];
 
   for (const dirName of names) {
     const sourcePath = path.join(skillsDir, dirName, "SKILL.md");
@@ -316,6 +439,7 @@ async function discoverSkills(source: ImportSource, skillsDir: string): Promise<
       category: "skills",
       source,
       sourcePath,
+      envActionItems: [],
       item: {
         name: dirName,
         description: `Imported ${source} skill ${dirName}`,
@@ -453,8 +577,9 @@ function parseCodexMcpToml(raw: string, filePath: string): Record<string, Record
 
 async function discoverCodexMcp(
   sourcePath: string,
-  warnings: ImportWarning[]
-): Promise<DiscoveredItem[]> {
+  warnings: ImportWarning[],
+  policy: EnvPolicy
+): Promise<DiscoveryRawItem[]> {
   if (!(await fileExists(sourcePath))) {
     return [];
   }
@@ -469,9 +594,20 @@ async function discoverCodexMcp(
 
   return Object.entries(mcpMap)
     .sort(([a], [b]) => a.localeCompare(b))
-    .flatMap(([name, raw]) => {
-      const item = normalizeMcpServer(name, raw, "codex", sourcePath, warnings);
-      return item ? [{ category: "mcp" as const, item, source: "codex" as const, sourcePath }] : [];
+    .flatMap(([name, raw]): DiscoveryRawItem[] => {
+      const normalized = normalizeMcpServer(name, raw, "codex", sourcePath, warnings, policy);
+      if (!normalized) {
+        return [];
+      }
+      return [
+        {
+          category: "mcp",
+          item: normalized.server,
+          source: "codex",
+          sourcePath,
+          envActionItems: normalized.actionItems
+        }
+      ];
     });
 }
 
@@ -495,19 +631,20 @@ async function discoverCategory(
   source: ImportSource,
   category: ConcreteImportCategory,
   sourceDir: string,
-  warnings: ImportWarning[]
-): Promise<DiscoveredItem[]> {
+  warnings: ImportWarning[],
+  policy: EnvPolicy
+): Promise<DiscoveryRawItem[]> {
   if (category === "mcp") {
     if (source === "claude") {
-      return discoverJsonMcp(source, path.join(sourceDir, ".mcp.json"), warnings);
+      return discoverJsonMcp(source, path.join(sourceDir, ".mcp.json"), warnings, policy);
     }
     if (source === "cursor") {
-      return discoverJsonMcp(source, path.join(sourceDir, ".cursor", "mcp.json"), warnings);
+      return discoverJsonMcp(source, path.join(sourceDir, ".cursor", "mcp.json"), warnings, policy);
     }
     if (source === "opencode") {
-      return discoverJsonMcp(source, path.join(sourceDir, "opencode.json"), warnings);
+      return discoverJsonMcp(source, path.join(sourceDir, "opencode.json"), warnings, policy);
     }
-    return discoverCodexMcp(path.join(sourceDir, ".codex", "config.toml"), warnings);
+    return discoverCodexMcp(path.join(sourceDir, ".codex", "config.toml"), warnings, policy);
   }
 
   if (category === "commands") {
@@ -672,28 +809,27 @@ function describeMcpRuntimeMatch(server: McpServerConfig): string {
   return `${server.transport.toUpperCase()} endpoint`;
 }
 
-function mergeMcpTargets(existing: McpServerConfig, incoming: McpServerConfig): Target[] {
+function plannedTargetMerge(existing: McpServerConfig, incoming: McpServerConfig): Target[] {
   if (!incoming.targets || incoming.targets.length === 0 || !existing.targets) {
     return [];
   }
 
-  const mergedTargets = [...existing.targets];
-  const seen = new Set<Target>(mergedTargets);
-  const addedTargets: Target[] = [];
-
+  const seen = new Set<Target>(existing.targets);
+  const additions: Target[] = [];
   for (const target of incoming.targets) {
     if (!seen.has(target)) {
-      mergedTargets.push(target);
-      addedTargets.push(target);
+      additions.push(target);
       seen.add(target);
     }
   }
+  return additions;
+}
 
-  if (addedTargets.length > 0) {
-    existing.targets = mergedTargets;
+function applyTargetMerge(existing: McpServerConfig, mergedTargets: Target[]): void {
+  if (mergedTargets.length === 0 || !existing.targets) {
+    return;
   }
-
-  return addedTargets;
+  existing.targets = [...existing.targets, ...mergedTargets];
 }
 
 function equivalentItem(category: ConcreteImportCategory, left: ImportedItem, right: ImportedItem): boolean {
@@ -718,17 +854,41 @@ function emptyCounts(): Record<ConcreteImportCategory, ImportCounts> {
   };
 }
 
-function addImportedItem(config: AgentportConfig, discovered: DiscoveredItem): void {
-  const key = categoryToConfigKey(discovered.category);
+function appendItemToConfig(config: AgentportConfig, category: ConcreteImportCategory, item: ImportedItem): void {
+  const key = categoryToConfigKey(category);
   if (key === "mcpServers") {
-    config.mcpServers = [...(config.mcpServers ?? []), discovered.item as McpServerConfig];
+    config.mcpServers = [...(config.mcpServers ?? []), item as McpServerConfig];
     return;
   }
   if (key === "skills") {
-    config.skills = [...(config.skills ?? []), discovered.item as SkillConfig];
+    config.skills = [...(config.skills ?? []), item as SkillConfig];
     return;
   }
-  config.commands = [...(config.commands ?? []), discovered.item as CommandConfig];
+  config.commands = [...(config.commands ?? []), item as CommandConfig];
+}
+
+function replaceItemInConfig(
+  config: AgentportConfig,
+  category: ConcreteImportCategory,
+  name: string,
+  next: ImportedItem
+): void {
+  const key = categoryToConfigKey(category);
+  if (key === "mcpServers") {
+    config.mcpServers = (config.mcpServers ?? []).map((item) =>
+      item.name === name ? (next as McpServerConfig) : item
+    );
+    return;
+  }
+  if (key === "skills") {
+    config.skills = (config.skills ?? []).map((item) =>
+      item.name === name ? (next as SkillConfig) : item
+    );
+    return;
+  }
+  config.commands = (config.commands ?? []).map((item) =>
+    item.name === name ? (next as CommandConfig) : item
+  );
 }
 
 function getExistingItems(config: AgentportConfig, category: ConcreteImportCategory): ImportedItem[] {
@@ -742,20 +902,19 @@ function getExistingItems(config: AgentportConfig, category: ConcreteImportCateg
 }
 
 function findPossibleMcpDuplicates(
-  config: AgentportConfig,
-  discovered: DiscoveredItem
+  baseConfig: AgentportConfig,
+  incoming: McpServerConfig,
+  sourcePath: string
 ): ImportPossibleDuplicate[] {
-  const incoming = discovered.item as McpServerConfig;
-
-  return (config.mcpServers ?? [])
+  return (baseConfig.mcpServers ?? [])
     .filter((existing) => existing.name !== incoming.name)
     .filter((existing) => mcpRuntimeAndSecretShapeEqual(existing, incoming))
     .map((existing) => ({
       category: "mcp" as const,
       importedName: incoming.name,
       existingName: existing.name,
-      sourcePath: discovered.sourcePath,
-      message: `Possible duplicate MCP server "${incoming.name}" from ${discovered.sourcePath} matches existing "${existing.name}" by ${describeMcpRuntimeMatch(incoming)} and secret key shape`
+      sourcePath,
+      message: `Possible duplicate MCP server "${incoming.name}" from ${sourcePath} matches existing "${existing.name}" by ${describeMcpRuntimeMatch(incoming)} and secret key shape`
     }));
 }
 
@@ -763,12 +922,169 @@ async function loadOrCreateConfig(configPath: string): Promise<AgentportConfig> 
   return (await fileExists(configPath)) ? await loadConfig(configPath) : { version: 1 };
 }
 
-export async function importProject(options: ImportOptions): Promise<ImportResult> {
+export function summarizeMcpRedacted(server: McpServerConfig): string {
+  const parts: string[] = [`transport=${server.transport}`];
+  if (server.transport === "stdio") {
+    parts.push(`command=${server.command ?? ""}`);
+    if (server.args && server.args.length > 0) {
+      parts.push(`args=[${server.args.map((arg) => JSON.stringify(arg)).join(", ")}]`);
+    }
+  } else {
+    parts.push(`url=${server.url ?? ""}`);
+  }
+  if (server.targets && server.targets.length > 0) {
+    parts.push(`targets=[${server.targets.join(", ")}]`);
+  }
+  if (server.env) {
+    const envSummary = Object.entries(server.env)
+      .map(([key, value]) => `${key}=${redactValue(value)}`)
+      .join(", ");
+    parts.push(`env={${envSummary}}`);
+  }
+  if (server.headers) {
+    const headerSummary = Object.entries(server.headers)
+      .map(([key, value]) => `${key}=${redactValue(value)}`)
+      .join(", ");
+    parts.push(`headers={${headerSummary}}`);
+  }
+  return parts.join(" ");
+}
+
+export function summarizeItemRedacted(category: ConcreteImportCategory, item: ImportedItem): string {
+  if (category === "mcp") {
+    return summarizeMcpRedacted(item as McpServerConfig);
+  }
+  if (category === "skills") {
+    const skill = item as SkillConfig;
+    const length = (skill.content ?? "").length;
+    return `name=${skill.name} description="${skill.description ?? ""}" content(${length} chars)`;
+  }
+  const command = item as CommandConfig;
+  const length = (command.prompt ?? "").length;
+  return `name=${command.name} prompt(${length} chars)`;
+}
+
+function classifyAgainst(
+  category: ConcreteImportCategory,
+  incoming: ImportedItem,
+  existing: ImportedItem,
+  conflictSource: ConflictSource
+): CandidateClassification {
+  if (category === "mcp") {
+    const existingMcp = existing as McpServerConfig;
+    const incomingMcp = incoming as McpServerConfig;
+    if (mcpRuntimeAndSecretShapeEqual(existingMcp, incomingMcp)) {
+      const mergedTargets = plannedTargetMerge(existingMcp, incomingMcp);
+      if (mergedTargets.length > 0) {
+        return { kind: "merge", mergedTargets };
+      }
+      return { kind: "unchanged" };
+    }
+
+    const dimensions = getMcpDifferenceDimensions(existingMcp, incomingMcp);
+    return {
+      kind: "conflict",
+      differenceDimensions: dimensions,
+      safeMergeAvailable: false,
+      conflictSource,
+      existing: existingMcp,
+      existingSummary: summarizeMcpRedacted(existingMcp),
+      incomingSummary: summarizeMcpRedacted(incomingMcp)
+    };
+  }
+
+  if (equivalentItem(category, existing, incoming)) {
+    return { kind: "unchanged" };
+  }
+
+  return {
+    kind: "conflict",
+    differenceDimensions: ["content"],
+    safeMergeAvailable: false,
+    conflictSource,
+    existing,
+    existingSummary: summarizeItemRedacted(category, existing),
+    incomingSummary: summarizeItemRedacted(category, incoming)
+  };
+}
+
+function classifyCandidate(
+  baseConfig: AgentportConfig,
+  earlier: DiscoveredItem[],
+  raw: DiscoveryRawItem
+): {
+  classification: CandidateClassification;
+  possibleDuplicates: ImportPossibleDuplicate[];
+} {
+  const existing = getExistingItems(baseConfig, raw.category).find(
+    (candidate) => getItemName(candidate) === getItemName(raw.item)
+  );
+
+  if (existing) {
+    return {
+      classification: classifyAgainst(raw.category, raw.item, existing, "base-config"),
+      possibleDuplicates: []
+    };
+  }
+
+  const earlierMatch = earlier.find(
+    (candidate) =>
+      candidate.category === raw.category &&
+      getItemName(candidate.item) === getItemName(raw.item) &&
+      candidate.classification.kind !== "conflict"
+  );
+
+  if (earlierMatch) {
+    return {
+      classification: classifyAgainst(raw.category, raw.item, earlierMatch.item, "earlier-candidate"),
+      possibleDuplicates: []
+    };
+  }
+
+  const possibleDuplicates: ImportPossibleDuplicate[] = [];
+  if (raw.category === "mcp") {
+    const incoming = raw.item as McpServerConfig;
+    possibleDuplicates.push(
+      ...findPossibleMcpDuplicates(baseConfig, incoming, raw.sourcePath)
+    );
+
+    for (const previous of earlier) {
+      if (previous.category !== "mcp") {
+        continue;
+      }
+      if (previous.classification.kind !== "new") {
+        continue;
+      }
+      const previousMcp = previous.item as McpServerConfig;
+      if (previousMcp.name === incoming.name) {
+        continue;
+      }
+      if (!mcpRuntimeAndSecretShapeEqual(previousMcp, incoming)) {
+        continue;
+      }
+      possibleDuplicates.push({
+        category: "mcp",
+        importedName: incoming.name,
+        existingName: previousMcp.name,
+        sourcePath: raw.sourcePath,
+        message: `Possible duplicate MCP server "${incoming.name}" from ${raw.sourcePath} matches earlier "${previousMcp.name}" by ${describeMcpRuntimeMatch(incoming)} and secret key shape`
+      });
+    }
+  }
+  return { classification: { kind: "new" }, possibleDuplicates };
+}
+
+function buildCandidateId(raw: DiscoveryRawItem): string {
+  return `${raw.category}:${raw.source}:${getItemName(raw.item)}`;
+}
+
+export async function planImport(options: ImportOptions): Promise<ImportPlan> {
   const categories = expandImportCategories(options.categories);
+  const policy = options.envPolicy ?? NON_INTERACTIVE_ENV_POLICY;
   const discovery: ImportDiscoveryStatus[] = [];
   const skipped: ImportSkip[] = [];
   const warnings: ImportWarning[] = [];
-  const discovered: DiscoveredItem[] = [];
+  const rawItems: DiscoveryRawItem[] = [];
 
   for (const source of options.sources) {
     for (const category of categories) {
@@ -779,89 +1095,29 @@ export async function importProject(options: ImportOptions): Promise<ImportResul
         continue;
       }
 
-      const items = await discoverCategory(source, category, options.sourceDir, warnings);
+      const items = await discoverCategory(source, category, options.sourceDir, warnings, policy);
       discovery.push({ source, category, supported: true, discovered: items.length });
-      discovered.push(...items);
+      rawItems.push(...items);
     }
   }
 
   const baseConfig = await loadOrCreateConfig(options.configPath);
-  const mergedConfig = cloneConfig(baseConfig);
-  const imported: DiscoveredItem[] = [];
-  const unchanged: DiscoveredItem[] = [];
-  const merged: ImportMerge[] = [];
-  const conflicts: ImportConflict[] = [];
-  const possibleDuplicates: ImportPossibleDuplicate[] = [];
+  const candidates: DiscoveredItem[] = [];
+  const envActionItems: EnvActionItem[] = [];
 
-  for (const item of discovered) {
-    const existing = getExistingItems(mergedConfig, item.category).find(
-      (candidate) => getItemName(candidate) === getItemName(item.item)
-    );
-
-    if (!existing) {
-      if (item.category === "mcp") {
-        possibleDuplicates.push(...findPossibleMcpDuplicates(mergedConfig, item));
-      }
-      addImportedItem(mergedConfig, item);
-      imported.push(item);
-      continue;
-    }
-
-    if (item.category === "mcp") {
-      const existingMcp = existing as McpServerConfig;
-      const incomingMcp = item.item as McpServerConfig;
-      if (mcpRuntimeAndSecretShapeEqual(existingMcp, incomingMcp)) {
-        const mergedTargets = mergeMcpTargets(existingMcp, incomingMcp);
-        if (mergedTargets.length > 0) {
-          merged.push({
-            category: "mcp",
-            name: incomingMcp.name,
-            sourcePath: item.sourcePath,
-            mergedTargets,
-            message: `Merged MCP server "${incomingMcp.name}" target eligibility from ${item.sourcePath}: ${mergedTargets.join(", ")}`
-          });
-        } else {
-          unchanged.push(item);
-        }
-        continue;
-      }
-
-      const dimensions = getMcpDifferenceDimensions(existingMcp, incomingMcp);
-      conflicts.push({
-        category: item.category,
-        name: getItemName(item.item),
-        sourcePath: item.sourcePath,
-        message: `Conflicting MCP server "${getItemName(item.item)}" from ${item.sourcePath} differs by ${dimensions.join(", ")}`
-      });
-      continue;
-    }
-
-    if (equivalentItem(item.category, existing, item.item)) {
-      unchanged.push(item);
-      continue;
-    }
-
-    conflicts.push({
-      category: item.category,
-      name: getItemName(item.item),
-      sourcePath: item.sourcePath,
-      message: `Conflicting ${item.category} item "${getItemName(item.item)}" from ${item.sourcePath}`
+  for (const raw of rawItems) {
+    const { classification, possibleDuplicates } = classifyCandidate(baseConfig, candidates, raw);
+    candidates.push({
+      id: buildCandidateId(raw),
+      category: raw.category,
+      item: raw.item,
+      source: raw.source,
+      sourcePath: raw.sourcePath,
+      classification,
+      possibleDuplicates,
+      envActionItems: raw.envActionItems
     });
-  }
-
-  const countsByCategory = emptyCounts();
-  for (const item of imported) countsByCategory[item.category].imported += 1;
-  for (const item of skipped) countsByCategory[item.category].skipped += 1;
-  for (const item of unchanged) countsByCategory[item.category].unchanged += 1;
-  for (const item of conflicts) countsByCategory[item.category].conflicts += 1;
-  for (const item of warnings) countsByCategory[item.category].warnings += 1;
-
-  const configChanged = imported.length > 0 || merged.length > 0;
-  const configWritten = configChanged && conflicts.length === 0 && !options.dryRun;
-
-  if (conflicts.length === 0 && configWritten) {
-    await mkdir(path.dirname(options.configPath), { recursive: true });
-    await writeFile(options.configPath, YAML.stringify(mergedConfig), "utf8");
+    envActionItems.push(...raw.envActionItems);
   }
 
   return {
@@ -869,20 +1125,346 @@ export async function importProject(options: ImportOptions): Promise<ImportResul
     sourceDir: options.sourceDir,
     sources: options.sources,
     categories,
-    imported,
+    baseConfig,
+    candidates,
     discovery,
     skipped,
+    warnings,
+    envActionItems,
+    envPolicy: policy
+  };
+}
+
+function defaultSelection(plan: ImportPlan): ResolvedSelection {
+  const selectedIds = new Set<string>();
+  const conflictActions = new Map<string, ConflictAction>();
+  for (const candidate of plan.candidates) {
+    selectedIds.add(candidate.id);
+  }
+  return { selectedIds, conflictActions };
+}
+
+function ensureUniqueRename(
+  category: ConcreteImportCategory,
+  newName: string,
+  workingConfig: AgentportConfig
+): void {
+  const existingNames = new Set(getExistingItems(workingConfig, category).map((item) => item.name));
+  if (existingNames.has(newName)) {
+    throw new Error(
+      `Renamed ${category} item "${newName}" conflicts with an existing ${category} item; choose a different name.`
+    );
+  }
+}
+
+function overrideKey(candidateId: string, fieldKind: "env" | "header", fieldKey: string): string {
+  return `${candidateId}::${fieldKind}:${fieldKey}`;
+}
+
+function buildOverrideMap(overrides: EnvOverride[] | undefined): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const override of overrides ?? []) {
+    map.set(overrideKey(override.candidateId, override.fieldKind, override.fieldKey), override.envVar);
+  }
+  return map;
+}
+
+function rewritePlaceholderValue(value: string, newEnvVar: string): string {
+  const trimmed = value.trim();
+  const bearerMatch = trimmed.match(/^Bearer\s+\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/);
+  if (bearerMatch) {
+    return `Bearer {env:${newEnvVar}}`;
+  }
+  if (/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.test(trimmed)) {
+    return `{env:${newEnvVar}}`;
+  }
+  return value;
+}
+
+function applyOverridesToServer(
+  server: McpServerConfig,
+  candidateId: string,
+  overrides: Map<string, string>
+): McpServerConfig {
+  if (overrides.size === 0) {
+    return server;
+  }
+
+  const next: McpServerConfig = { ...server };
+
+  if (server.env) {
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(server.env)) {
+      const override = overrides.get(overrideKey(candidateId, "env", key));
+      env[key] = override ? rewritePlaceholderValue(value, override) : value;
+    }
+    next.env = env;
+  }
+
+  if (server.headers) {
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(server.headers)) {
+      const override = overrides.get(overrideKey(candidateId, "header", key));
+      headers[key] = override ? rewritePlaceholderValue(value, override) : value;
+    }
+    next.headers = headers;
+  }
+
+  return next;
+}
+
+function rewriteActionItemsForOverrides(
+  candidateId: string,
+  actionItems: EnvActionItem[],
+  overrides: Map<string, string>
+): EnvActionItem[] {
+  if (overrides.size === 0) {
+    return actionItems;
+  }
+
+  return actionItems.map((item) => {
+    const override = overrides.get(overrideKey(candidateId, item.field.kind, item.field.key));
+    if (!override || override === item.envVar) {
+      return item;
+    }
+    return {
+      ...item,
+      envVar: override,
+      message: item.message.replace(item.envVar, override)
+    };
+  });
+}
+
+export async function applyImportPlan(options: ApplyImportOptions): Promise<ImportResult> {
+  const plan = options.plan;
+  const dryRun = Boolean(options.dryRun);
+  const selection = options.selection ?? defaultSelection(plan);
+  const mergedConfig = cloneConfig(plan.baseConfig);
+  const overrideMap = buildOverrideMap(selection.envOverrides);
+
+  const imported: DiscoveredItem[] = [];
+  const unchanged: DiscoveredItem[] = [];
+  const merged: ImportMerge[] = [];
+  const conflicts: ImportConflict[] = [];
+  const possibleDuplicates: ImportPossibleDuplicate[] = [];
+  const finalActionItems: EnvActionItem[] = [];
+  let aborted = false;
+
+  const recordImported = (candidate: DiscoveredItem, writtenItem: ImportedItem): void => {
+    imported.push({ ...candidate, item: writtenItem });
+    if (candidate.category === "mcp" && candidate.envActionItems.length > 0) {
+      finalActionItems.push(
+        ...rewriteActionItemsForOverrides(candidate.id, candidate.envActionItems, overrideMap)
+      );
+    }
+  };
+
+  const transformedItem = (candidate: DiscoveredItem): ImportedItem => {
+    if (candidate.category !== "mcp") {
+      return candidate.item;
+    }
+    return applyOverridesToServer(candidate.item as McpServerConfig, candidate.id, overrideMap);
+  };
+
+  for (const candidate of plan.candidates) {
+    const isSelected = selection.selectedIds.has(candidate.id);
+
+    if (candidate.classification.kind === "new") {
+      if (!isSelected) {
+        continue;
+      }
+      const item = transformedItem(candidate);
+      appendItemToConfig(mergedConfig, candidate.category, item);
+      recordImported(candidate, item);
+      continue;
+    }
+
+    if (candidate.classification.kind === "merge") {
+      if (!isSelected) {
+        continue;
+      }
+      const existing = getExistingItems(mergedConfig, candidate.category).find(
+        (item) => item.name === candidate.item.name
+      ) as McpServerConfig | undefined;
+      if (existing) {
+        applyTargetMerge(existing, candidate.classification.mergedTargets);
+      }
+      merged.push({
+        category: "mcp",
+        name: candidate.item.name,
+        sourcePath: candidate.sourcePath,
+        mergedTargets: candidate.classification.mergedTargets,
+        message: `Merged MCP server "${candidate.item.name}" target eligibility from ${candidate.sourcePath}: ${candidate.classification.mergedTargets.join(", ")}`
+      });
+      continue;
+    }
+
+    if (candidate.classification.kind === "unchanged") {
+      unchanged.push(candidate);
+      continue;
+    }
+
+    if (!isSelected) {
+      continue;
+    }
+
+    const conflictAction = selection.conflictActions.get(candidate.id);
+    if (!conflictAction) {
+      conflicts.push({
+        category: candidate.category,
+        name: candidate.item.name,
+        sourcePath: candidate.sourcePath,
+        message:
+          candidate.category === "mcp"
+            ? `Conflicting MCP server "${candidate.item.name}" from ${candidate.sourcePath} differs by ${candidate.classification.differenceDimensions.join(", ")}`
+            : `Conflicting ${candidate.category} item "${candidate.item.name}" from ${candidate.sourcePath}`
+      });
+      continue;
+    }
+
+    if (conflictAction.type === "abort") {
+      aborted = true;
+      break;
+    }
+
+    if (conflictAction.type === "keep" || conflictAction.type === "skip") {
+      continue;
+    }
+
+    if (conflictAction.type === "replace") {
+      const item = transformedItem(candidate);
+      const targetName =
+        candidate.classification.conflictSource === "earlier-candidate"
+          ? candidate.classification.existing.name
+          : candidate.item.name;
+      replaceItemInConfig(mergedConfig, candidate.category, targetName, item);
+      if (candidate.classification.conflictSource === "earlier-candidate") {
+        const replacedIndex = imported.findIndex(
+          (entry) => entry.category === candidate.category && entry.item.name === targetName
+        );
+        if (replacedIndex !== -1) {
+          const removed = imported.splice(replacedIndex, 1)[0];
+          if (removed) {
+            for (let i = finalActionItems.length - 1; i >= 0; i -= 1) {
+              if (finalActionItems[i]!.itemName === removed.item.name) {
+                finalActionItems.splice(i, 1);
+              }
+            }
+          }
+        }
+      }
+      recordImported(candidate, item);
+      continue;
+    }
+
+    if (conflictAction.type === "rename") {
+      ensureUniqueRename(candidate.category, conflictAction.newName, mergedConfig);
+      const baseItem = transformedItem(candidate);
+      const renamedItem: ImportedItem = { ...baseItem, name: conflictAction.newName };
+      appendItemToConfig(mergedConfig, candidate.category, renamedItem);
+      recordImported(candidate, renamedItem);
+      continue;
+    }
+
+    if (conflictAction.type === "merge") {
+      if (!candidate.classification.safeMergeAvailable || candidate.category !== "mcp") {
+        conflicts.push({
+          category: candidate.category,
+          name: candidate.item.name,
+          sourcePath: candidate.sourcePath,
+          message: `No safe merge available for ${candidate.category} "${candidate.item.name}" from ${candidate.sourcePath}; pick keep, replace, rename, or abort.`
+        });
+        continue;
+      }
+    }
+  }
+
+  if (!aborted) {
+    const baseMcpNames = new Set(
+      (plan.baseConfig.mcpServers ?? []).map((server) => server.name)
+    );
+    const importedMcpRank = new Map<string, number>();
+    let rank = 0;
+    for (const candidate of imported) {
+      if (candidate.category === "mcp") {
+        importedMcpRank.set(candidate.item.name, rank);
+        rank += 1;
+      }
+    }
+
+    const finalMcpServers = mergedConfig.mcpServers ?? [];
+    for (const candidate of imported) {
+      if (candidate.category !== "mcp") {
+        continue;
+      }
+      const incoming = candidate.item as McpServerConfig;
+      const myRank = importedMcpRank.get(incoming.name) ?? -1;
+      for (const existing of finalMcpServers) {
+        if (existing.name === incoming.name) {
+          continue;
+        }
+        if (!mcpRuntimeAndSecretShapeEqual(existing, incoming)) {
+          continue;
+        }
+        const otherIsBase = baseMcpNames.has(existing.name);
+        const otherRank = importedMcpRank.get(existing.name);
+        const includePair =
+          otherIsBase || (otherRank !== undefined && otherRank < myRank);
+        if (!includePair) {
+          continue;
+        }
+        possibleDuplicates.push({
+          category: "mcp",
+          importedName: incoming.name,
+          existingName: existing.name,
+          sourcePath: candidate.sourcePath,
+          message: `Possible duplicate MCP server "${incoming.name}" from ${candidate.sourcePath} matches existing "${existing.name}" by ${describeMcpRuntimeMatch(incoming)} and secret key shape`
+        });
+      }
+    }
+  }
+
+  const countsByCategory = emptyCounts();
+  for (const item of imported) countsByCategory[item.category].imported += 1;
+  for (const item of plan.skipped) countsByCategory[item.category].skipped += 1;
+  for (const item of unchanged) countsByCategory[item.category].unchanged += 1;
+  for (const item of conflicts) countsByCategory[item.category].conflicts += 1;
+  for (const item of plan.warnings) countsByCategory[item.category].warnings += 1;
+
+  const configChanged = !aborted && (imported.length > 0 || merged.length > 0);
+  const configWritten = configChanged && conflicts.length === 0 && !dryRun;
+
+  if (configWritten) {
+    await mkdir(path.dirname(plan.configPath), { recursive: true });
+    await writeFile(plan.configPath, YAML.stringify(mergedConfig), "utf8");
+  }
+
+  return {
+    configPath: plan.configPath,
+    sourceDir: plan.sourceDir,
+    sources: plan.sources,
+    categories: plan.categories,
+    imported,
+    discovery: plan.discovery,
+    skipped: plan.skipped,
     unchanged,
     merged,
     conflicts,
     possibleDuplicates,
-    warnings,
+    warnings: plan.warnings,
+    envActionItems: finalActionItems,
     countsByCategory,
     configWritten,
     configChanged,
-    dryRun: Boolean(options.dryRun),
+    dryRun,
+    aborted,
     mergedConfig
   };
+}
+
+export async function importProject(options: ImportOptions): Promise<ImportResult> {
+  const plan = await planImport(options);
+  return applyImportPlan({ plan, dryRun: options.dryRun });
 }
 
 export function assertValidImportSources(values: string[]): ImportSource[] {
@@ -920,3 +1502,5 @@ export function assertValidImportCategories(values: string[]): ImportCategory[] 
 
   return values as ImportCategory[];
 }
+
+export { applyEnvPolicyToServer };

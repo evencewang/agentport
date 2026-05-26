@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -104,6 +105,67 @@ test("import CLI reports supported-but-empty discovery combinations", async () =
   assert.match(result.stdout, /commands: imported 0/);
   assert.match(result.stdout, /\[discovery:commands\] claude: 0 discovered/);
   assert.match(result.stdout, /Nothing changed/);
+});
+
+test("import CLI completes non-interactive flow without reading stdin", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-no-prompt-"));
+  await mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+  await writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Review.\n", "utf8");
+
+  const child = execFile(
+    process.execPath,
+    [cliPath, "import", "--from", "opencode", "--include", "mcp", "--dry-run"],
+    { cwd }
+  );
+
+  if (child.stdin) {
+    child.stdin.destroy();
+  }
+
+  const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>(
+    (resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ stdout, stderr, code }));
+    }
+  );
+
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /Sources: opencode/);
+  assert.match(result.stdout, /mcp: imported 0/);
+});
+
+test("import CLI prints env action items without secret values for env_http_headers and bearer tokens", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-env-actions-"));
+  await mkdir(path.join(cwd, ".codex"), { recursive: true });
+  await writeFile(
+    path.join(cwd, ".codex", "config.toml"),
+    `[mcp_servers.codexHttp]
+url = "https://codex.example/mcp"
+http_headers = { Authorization = "Bearer codex-secret" }
+env_http_headers = { X_API_KEY = "CODEX_API_KEY" }
+bearer_token_env_var = "CODEX_BEARER"
+`,
+    "utf8"
+  );
+
+  const result = await execFileAsync(
+    process.execPath,
+    [cliPath, "import", "--from", "codex", "--include", "mcp", "--dry-run"],
+    { cwd }
+  );
+
+  assert.match(result.stdout, /\[env-action:codexHttp\]/);
+  assert.match(result.stdout, /CODEX_API_KEY/);
+  assert.match(result.stdout, /CODEX_BEARER/);
+  assert.doesNotMatch(result.stdout, /codex-secret/);
 });
 
 test("import CLI reports MCP conflicts and possible duplicates without secret values", async () => {

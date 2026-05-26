@@ -132,10 +132,93 @@ node dist/cli.js import --from claude,cursor --include mcp,commands --dry-run
 node dist/cli.js import --from opencode --from codex --include mcp --include skills
 ```
 
-`--from` and `--include` are explicit and required. Both flags support repeated
-values and comma-separated values. By default, import scans the current directory
-and writes `agentkit.yml`; use `--source-dir <dir>` and `--config <path>` to
-override those paths.
+`--from` and `--include` are explicit and required for non-interactive imports.
+Both flags support repeated values and comma-separated values. By default,
+import scans the current directory and writes `agentkit.yml`; use
+`--source-dir <dir>` and `--config <path>` to override those paths.
+
+### Interactive import
+
+Use `--interactive` to review and pick exactly what gets written:
+
+```bash
+node dist/cli.js import --interactive
+node dist/cli.js import --interactive --from claude,cursor --include mcp
+node dist/cli.js import --interactive --dry-run
+```
+
+In interactive mode, agentport prompts for `--from` and `--include` when they
+are omitted, then walks each requested category as an independent checklist:
+
+- MCP servers
+- Skills
+- Commands
+
+Each candidate item is listed with its source, classification (`new`, `merge`,
+`unchanged`, or `conflict`), and a redacted summary. You can independently
+include or skip items in each checklist before reviewing conflicts and a final
+preview. You can revisit category checklists from the preview before
+confirming the write. Cancelling at any point exits without writing
+`agentkit.yml`.
+
+For same-category same-name conflicts, you choose one of:
+
+- Keep existing (skip imported)
+- Replace existing with imported
+- Import as a renamed copy (validated against existing names in that category)
+- Merge MCP target eligibility (only when a safe MCP target merge is available)
+- Abort import without writing
+
+Conflict prompts and previews show only redacted summaries; secret values are
+never printed in conflict messages, possible-duplicate notes, env action items,
+or final output.
+
+### Env and secret handling
+
+Agentport treats `{env:NAME}` as the canonical portable placeholder for
+secrets in imported MCP `env` and `headers` values. During import,
+agentport always normalizes the following:
+
+- `{env:NAME}` values are preserved as-is.
+- `$NAME` and `${NAME}` shell-style references are normalized to `{env:NAME}`.
+- `env_http_headers: { Header = "ENV_NAME" }` becomes
+  `headers: { Header: "{env:ENV_NAME}" }`.
+- `bearer_token_env_var = "ENV_NAME"` becomes
+  `headers.Authorization: "Bearer {env:ENV_NAME}"` when no explicit
+  Authorization header is present. If an explicit Authorization header already
+  exists, agentport preserves it untouched and surfaces an env action item
+  asking you to review the conflict.
+
+For literal-looking and masked MCP secret values, behavior depends on the env
+policy:
+
+- Non-interactive default (`--env-policy preserve`): preserve current
+  values literally so existing scripts keep their output. Configure the
+  generated values yourself before committing.
+- Interactive default (and `--env-policy placeholder` non-interactively):
+  rewrite literal/masked secret values to `{env:NAME}` placeholders without
+  ever writing the original value, and emit env action items listing the env
+  vars you must define for runtime.
+
+Env action items appear in command output (and in the interactive preview) as
+`[env-action:<mcp-name>]` lines. They never contain secret values; they only
+name the env variables you need to set for the imported MCP servers to work.
+Existing `{env:NAME}` placeholders are preserved as-is and still produce env
+action items so the user has a complete setup checklist; you can override
+proposed env var names in interactive mode for non-preserved cases (literal,
+masked, shell-var, env_http_headers, bearer-token).
+
+In interactive mode, after selection and conflict resolution, agentport asks
+whether to accept the proposed env var names or edit them individually. The
+edit flow lets you rename each proposed placeholder per MCP field. The
+preview, written placeholders, and final action items all use the names you
+chose.
+
+Env action items in the final import result are scoped to the items that were
+actually selected and written; deselected, kept-existing, and skipped items do
+not contribute env action items.
+
+### Source layout and conflicts
 
 Supported local import conventions:
 
@@ -147,8 +230,10 @@ Supported local import conventions:
 | `codex` | `.codex/config.toml` `[mcp_servers.<name>]` | unsupported | `.codex/skills/*/SKILL.md` |
 
 Unsupported source/category combinations are reported as skipped, not fatal.
-Equivalent duplicates are reported as unchanged. Conflicting duplicates with the
-same category and name abort without writing.
+Equivalent duplicates are reported as unchanged. In non-interactive mode,
+conflicting duplicates with the same category and name abort without writing.
+In interactive mode, conflicts are resolved by your choice (keep, replace,
+rename, merge, abort).
 
 MCP imports use runtime-aware duplicate handling instead of full YAML/JSON object
 equality. For HTTP and SSE MCP servers, agentport compares transport plus a
@@ -162,7 +247,8 @@ When an imported MCP has the same name and runtime identity as an existing MCP,
 agentport keeps the existing runtime values as canonical. If the import includes
 additional explicit `targets`, they are merged without duplicates; otherwise the
 server is reported as unchanged. Same-name MCPs with different runtime identity
-or secret key shape remain blocking conflicts.
+or secret key shape remain blocking conflicts in non-interactive mode and
+prompt for resolution in interactive mode.
 
 Different-name MCPs that share the same runtime identity are reported as
 non-blocking possible duplicates. agentport still writes non-conflicting imports,
@@ -170,8 +256,8 @@ but it does not automatically merge, rename, or interactively resolve possible
 duplicates.
 
 MCP `env`, `headers`, Codex `http_headers`, `env_http_headers`, and bearer-token
-env-var fields are preserved where the universal config can represent them, but
-they trigger warnings so you can review secrets before committing generated YAML.
+env-var fields are normalized as described above, and triggering MCP entries
+emit warnings so you can review secrets before committing generated YAML.
 
 ## Output model
 
