@@ -151,6 +151,32 @@ test("discovers supported Claude, Cursor, OpenCode, and Codex import paths", asy
   );
 });
 
+test("discovers OpenCode global command and skill config directories", async () => {
+  const sourceDir = await mkdtemp(path.join(os.tmpdir(), "agentport-opencode-global-"));
+  const configPath = path.join(await mkdtemp(path.join(os.tmpdir(), "agentport-import-")), "agentkit.yml");
+
+  await writeText(path.join(sourceDir, "opencode.json"), JSON.stringify({ mcp: {} }));
+  await writeText(path.join(sourceDir, "commands", "review.md"), "Review from global commands\n");
+  await writeText(path.join(sourceDir, "command", "legacy.md"), "Review from legacy command dir\n");
+  await writeText(
+    path.join(sourceDir, "skills", "release", "SKILL.md"),
+    "OpenCode global release skill\n"
+  );
+
+  const result = await importProject({
+    configPath,
+    sourceDir,
+    sources: ["opencode"],
+    categories: ["all"],
+    dryRun: true
+  });
+
+  assert.deepEqual(result.mergedConfig.commands?.map((item) => item.name), ["review", "legacy"]);
+  assert.deepEqual(result.mergedConfig.skills?.map((item) => item.name), ["release"]);
+  assert.equal(result.imported.filter((item) => item.category === "commands").length, 2);
+  assert.equal(result.imported.filter((item) => item.category === "skills").length, 1);
+});
+
 test("category selection imports only requested categories", async () => {
   const sourceDir = await createSourceFixture();
 

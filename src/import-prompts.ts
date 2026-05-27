@@ -48,6 +48,14 @@ export function isCancelled<T>(value: T | PromptCancelled): value is PromptCance
   return value === PROMPT_CANCEL;
 }
 
+function assertInteractiveTerminal(): void {
+  if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
+    return;
+  }
+
+  throw new Error("Interactive import requires an interactive terminal.");
+}
+
 interface QueueAction {
   type: "select" | "multiselect" | "text" | "confirm";
   matcher?: (message: string) => boolean;
@@ -148,6 +156,7 @@ export async function createClackPromptAdapter(): Promise<PromptAdapter> {
     message: (text) => clack.log.message(text),
     note: (text) => clack.note(text),
     select: async <Value>(prompt: SelectPrompt<Value>) => {
+      assertInteractiveTerminal();
       const value = await clack.select({
         message: prompt.message,
         options: prompt.options as Array<{ value: unknown; label: string; hint?: string }>,
@@ -156,6 +165,7 @@ export async function createClackPromptAdapter(): Promise<PromptAdapter> {
       return wrap(value) as Value | PromptCancelled;
     },
     multiselect: async <Value>(prompt: MultiSelectPrompt<Value>) => {
+      assertInteractiveTerminal();
       const value = await clack.multiselect({
         message: prompt.message,
         options: prompt.options as Array<{ value: unknown; label: string; hint?: string }>,
@@ -165,6 +175,7 @@ export async function createClackPromptAdapter(): Promise<PromptAdapter> {
       return wrap(value) as Value[] | PromptCancelled;
     },
     text: async (prompt) => {
+      assertInteractiveTerminal();
       const validateFn = prompt.validate;
       const value = await clack.text({
         message: prompt.message,
@@ -179,6 +190,7 @@ export async function createClackPromptAdapter(): Promise<PromptAdapter> {
       return wrap(value);
     },
     confirm: async (prompt) => {
+      assertInteractiveTerminal();
       const value = await clack.confirm({
         message: prompt.message,
         initialValue: prompt.initialValue ?? true

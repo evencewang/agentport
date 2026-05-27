@@ -422,6 +422,26 @@ async function discoverCommands(
   return items;
 }
 
+async function discoverCommandsFromDirs(
+  source: ImportSource,
+  commandsDirs: string[]
+): Promise<DiscoveryRawItem[]> {
+  const seenPaths = new Set<string>();
+  const items: DiscoveryRawItem[] = [];
+
+  for (const commandsDir of commandsDirs) {
+    for (const item of await discoverCommands(source, commandsDir)) {
+      if (seenPaths.has(item.sourcePath)) {
+        continue;
+      }
+      seenPaths.add(item.sourcePath);
+      items.push(item);
+    }
+  }
+
+  return items;
+}
+
 async function discoverSkills(
   source: ImportSource,
   skillsDir: string
@@ -446,6 +466,26 @@ async function discoverSkills(
         content: await readFile(sourcePath, "utf8")
       }
     });
+  }
+
+  return items;
+}
+
+async function discoverSkillsFromDirs(
+  source: ImportSource,
+  skillsDirs: string[]
+): Promise<DiscoveryRawItem[]> {
+  const seenPaths = new Set<string>();
+  const items: DiscoveryRawItem[] = [];
+
+  for (const skillsDir of skillsDirs) {
+    for (const item of await discoverSkills(source, skillsDir)) {
+      if (seenPaths.has(item.sourcePath)) {
+        continue;
+      }
+      seenPaths.add(item.sourcePath);
+      items.push(item);
+    }
   }
 
   return items;
@@ -654,14 +694,21 @@ async function discoverCategory(
     if (source === "cursor") {
       return discoverCommands(source, path.join(sourceDir, ".cursor", "commands"));
     }
-    return discoverCommands(source, path.join(sourceDir, ".opencode", "commands"));
+    return discoverCommandsFromDirs(source, [
+      path.join(sourceDir, ".opencode", "commands"),
+      path.join(sourceDir, "commands"),
+      path.join(sourceDir, "command")
+    ]);
   }
 
   if (source === "claude") {
     return discoverSkills(source, path.join(sourceDir, ".claude", "skills"));
   }
   if (source === "opencode") {
-    return discoverSkills(source, path.join(sourceDir, ".opencode", "skills"));
+    return discoverSkillsFromDirs(source, [
+      path.join(sourceDir, ".opencode", "skills"),
+      path.join(sourceDir, "skills")
+    ]);
   }
   return discoverSkills(source, path.join(sourceDir, ".codex", "skills"));
 }

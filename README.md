@@ -124,31 +124,33 @@ config for any selected profile.
 
 ## Import existing tool config
 
-Preview imports before changing `agentkit.yml`:
+Review and choose imports before changing `agentkit.yml`:
 
 ```bash
+node dist/cli.js import
 node dist/cli.js import --from claude --include all --dry-run
 node dist/cli.js import --from claude,cursor --include mcp,commands --dry-run
 node dist/cli.js import --from opencode --from codex --include mcp --include skills
 ```
 
-`--from` and `--include` are explicit and required for non-interactive imports.
-Both flags support repeated values and comma-separated values. By default,
-import scans the current directory and writes `agentkit.yml`; use
+Import is interactive by default. When `--from` or `--include` are omitted,
+agentport prompts for them; when they are provided, they scope the interactive
+review. Both flags support repeated values and comma-separated values. By
+default, import scans the current directory and writes `agentkit.yml`; use
 `--source-dir <dir>` and `--config <path>` to override those paths.
 
 ### Interactive import
 
-Use `--interactive` to review and pick exactly what gets written:
+Use import to review and pick exactly what gets written:
 
 ```bash
-node dist/cli.js import --interactive
-node dist/cli.js import --interactive --from claude,cursor --include mcp
-node dist/cli.js import --interactive --dry-run
+node dist/cli.js import
+node dist/cli.js import --from claude,cursor --include mcp
+node dist/cli.js import --dry-run
 ```
 
-In interactive mode, agentport prompts for `--from` and `--include` when they
-are omitted, then walks each requested category as an independent checklist:
+During import, agentport prompts for `--from` and `--include` when they are
+omitted, then walks each requested category as an independent checklist:
 
 - MCP servers
 - Skills
@@ -192,27 +194,25 @@ agentport always normalizes the following:
 For literal-looking and masked MCP secret values, behavior depends on the env
 policy:
 
-- Non-interactive default (`--env-policy preserve`): preserve current
-  values literally so existing scripts keep their output. Configure the
-  generated values yourself before committing.
-- Interactive default (and `--env-policy placeholder` non-interactively):
-  rewrite literal/masked secret values to `{env:NAME}` placeholders without
-  ever writing the original value, and emit env action items listing the env
-  vars you must define for runtime.
+- Import default (`--env-policy placeholder`): rewrite literal/masked secret
+  values to `{env:NAME}` placeholders without ever writing the original value,
+  and emit env action items listing the env vars you must define for runtime.
+- `--env-policy preserve`: preserve current values literally so existing
+  scripts keep their output. Configure the generated values yourself before
+  committing.
 
-Env action items appear in command output (and in the interactive preview) as
-`[env-action:<mcp-name>]` lines. They never contain secret values; they only
-name the env variables you need to set for the imported MCP servers to work.
+Env action items appear in the interactive preview. They never contain secret
+values; they only name the env variables you need to set for the imported MCP
+servers to work.
 Existing `{env:NAME}` placeholders are preserved as-is and still produce env
 action items so the user has a complete setup checklist; you can override
-proposed env var names in interactive mode for non-preserved cases (literal,
-masked, shell-var, env_http_headers, bearer-token).
+proposed env var names for non-preserved cases (literal, masked, shell-var,
+env_http_headers, bearer-token).
 
-In interactive mode, after selection and conflict resolution, agentport asks
-whether to accept the proposed env var names or edit them individually. The
-edit flow lets you rename each proposed placeholder per MCP field. The
-preview, written placeholders, and final action items all use the names you
-chose.
+After selection and conflict resolution, agentport asks whether to accept the
+proposed env var names or edit them individually. The edit flow lets you rename
+each proposed placeholder per MCP field. The preview, written placeholders, and
+final action items all use the names you chose.
 
 Env action items in the final import result are scoped to the items that were
 actually selected and written; deselected, kept-existing, and skipped items do
@@ -226,14 +226,13 @@ Supported local import conventions:
 | --- | --- | --- | --- |
 | `claude` | `.mcp.json` | `.claude/commands/*.md` | `.claude/skills/*/SKILL.md` |
 | `cursor` | `.cursor/mcp.json` | `.cursor/commands/*.md` | unsupported |
-| `opencode` | `opencode.json` | `.opencode/commands/*.md` | `.opencode/skills/*/SKILL.md` |
+| `opencode` | `opencode.json` | `.opencode/commands/*.md`, `commands/*.md`, `command/*.md` | `.opencode/skills/*/SKILL.md`, `skills/*/SKILL.md` |
 | `codex` | `.codex/config.toml` `[mcp_servers.<name>]` | unsupported | `.codex/skills/*/SKILL.md` |
 
 Unsupported source/category combinations are reported as skipped, not fatal.
-Equivalent duplicates are reported as unchanged. In non-interactive mode,
-conflicting duplicates with the same category and name abort without writing.
-In interactive mode, conflicts are resolved by your choice (keep, replace,
-rename, merge, abort).
+Equivalent duplicates are reported as unchanged. Conflicting duplicates with
+the same category and name are resolved by your choice (keep, replace, rename,
+merge, abort).
 
 MCP imports use runtime-aware duplicate handling instead of full YAML/JSON object
 equality. For HTTP and SSE MCP servers, agentport compares transport plus a
@@ -247,8 +246,7 @@ When an imported MCP has the same name and runtime identity as an existing MCP,
 agentport keeps the existing runtime values as canonical. If the import includes
 additional explicit `targets`, they are merged without duplicates; otherwise the
 server is reported as unchanged. Same-name MCPs with different runtime identity
-or secret key shape remain blocking conflicts in non-interactive mode and
-prompt for resolution in interactive mode.
+or secret key shape prompt for resolution during import.
 
 Different-name MCPs that share the same runtime identity are reported as
 non-blocking possible duplicates. agentport still writes non-conflicting imports,

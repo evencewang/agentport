@@ -52,9 +52,7 @@ test("build reports missing default config with init guidance", async () => {
   );
 });
 
-test("import validates required and supported source/category flags", async () => {
-  await expectCliError(["import", "--include", "all", "--dry-run"], /Missing --from/);
-  await expectCliError(["import", "--from", "claude", "--dry-run"], /Missing --include/);
+test("import validates supported source/category flags", async () => {
   await expectCliError(
     ["import", "--from", "unknown", "--include", "all", "--dry-run"],
     /Unsupported import source "unknown"/
@@ -65,156 +63,35 @@ test("import validates required and supported source/category flags", async () =
   );
 });
 
-test("import accepts repeated and comma-separated source/category flags", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-import-"));
-  await mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
-  await writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Review.\n", "utf8");
-
-  const result = await execFileAsync(
-    process.execPath,
-    [
-      cliPath,
-      "import",
-      "--from",
-      "claude,cursor",
-      "--from",
-      "opencode",
-      "--include",
-      "mcp,commands",
-      "--include",
-      "skills",
-      "--dry-run"
-    ],
-    { cwd }
-  );
-
-  assert.match(result.stdout, /Sources: claude, cursor, opencode/);
-  assert.match(result.stdout, /Categories: mcp, skills, commands/);
-  assert.match(result.stdout, /commands: imported 1/);
-});
-
-test("import CLI reports supported-but-empty discovery combinations", async () => {
+test("import CLI accepts explicit scope and compatibility flag when nothing is importable", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-import-empty-"));
 
   const result = await execFileAsync(
     process.execPath,
-    [cliPath, "import", "--from", "claude", "--include", "commands", "--dry-run"],
+    [cliPath, "import", "--interactive", "--from", "claude", "--include", "commands", "--dry-run"],
     { cwd }
   );
 
-  assert.match(result.stdout, /commands: imported 0/);
-  assert.match(result.stdout, /\[discovery:commands\] claude: 0 discovered/);
-  assert.match(result.stdout, /Nothing changed/);
+  assert.match(result.stdout, /No importable items discovered/);
+  assert.match(result.stdout, /Nothing to import\. agentkit\.yml not written\./);
 });
 
-test("import CLI completes non-interactive flow without reading stdin", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-no-prompt-"));
+test("import CLI requires a terminal when interactive selection is needed", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-requires-tty-"));
   await mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
   await writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Review.\n", "utf8");
-
-  const child = execFile(
-    process.execPath,
-    [cliPath, "import", "--from", "opencode", "--include", "mcp", "--dry-run"],
-    { cwd }
-  );
-
-  if (child.stdin) {
-    child.stdin.destroy();
-  }
-
-  const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>(
-    (resolve, reject) => {
-      let stdout = "";
-      let stderr = "";
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
-      });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ stdout, stderr, code }));
-    }
-  );
-
-  assert.equal(result.code, 0);
-  assert.match(result.stdout, /Sources: opencode/);
-  assert.match(result.stdout, /mcp: imported 0/);
-});
-
-test("import CLI prints env action items without secret values for env_http_headers and bearer tokens", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-env-actions-"));
-  await mkdir(path.join(cwd, ".codex"), { recursive: true });
-  await writeFile(
-    path.join(cwd, ".codex", "config.toml"),
-    `[mcp_servers.codexHttp]
-url = "https://codex.example/mcp"
-http_headers = { Authorization = "Bearer codex-secret" }
-env_http_headers = { X_API_KEY = "CODEX_API_KEY" }
-bearer_token_env_var = "CODEX_BEARER"
-`,
-    "utf8"
-  );
-
-  const result = await execFileAsync(
-    process.execPath,
-    [cliPath, "import", "--from", "codex", "--include", "mcp", "--dry-run"],
-    { cwd }
-  );
-
-  assert.match(result.stdout, /\[env-action:codexHttp\]/);
-  assert.match(result.stdout, /CODEX_API_KEY/);
-  assert.match(result.stdout, /CODEX_BEARER/);
-  assert.doesNotMatch(result.stdout, /codex-secret/);
-});
-
-test("import CLI reports MCP conflicts and possible duplicates without secret values", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "agentport-cli-import-mcp-redaction-"));
-  await writeFile(
-    path.join(cwd, "agentkit.yml"),
-    `version: 1
-mcpServers:
-  - name: context7
-    transport: http
-    url: https://mcp.context7.com/mcp
-    headers:
-      Authorization: existing-secret
-`,
-    "utf8"
-  );
-  await writeFile(
-    path.join(cwd, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        context7: {
-          type: "http",
-          url: "https://mcp.context7.com/other",
-          headers: { Authorization: "imported-secret" }
-        },
-        context7Alias: {
-          type: "http",
-          url: "https://mcp.context7.com/mcp/",
-          headers: { Authorization: "alias-secret" }
-        }
-      }
-    }),
-    "utf8"
-  );
 
   await assert.rejects(
     () =>
       execFileAsync(
         process.execPath,
-        [cliPath, "import", "--from", "claude", "--include", "mcp"],
+        [cliPath, "import", "--from", "claude", "--include", "commands", "--dry-run"],
         { cwd }
       ),
     (error: unknown) => {
       const execError = error as ExecFileError & { stdout?: string };
       const output = `${execError.stdout ?? ""}${execError.stderr ?? ""}`;
-      assert.match(output, /\[conflict:mcp\]/);
-      assert.match(output, /\[possible-duplicate:mcp\]/);
-      assert.match(output, /header-like values/);
-      assert.doesNotMatch(output, /existing-secret|imported-secret|alias-secret/);
+      assert.match(output, /Interactive import requires an interactive terminal\./);
       return true;
     }
   );
